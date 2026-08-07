@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码（完整历史与 tags）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装依赖
+        run: npm install
+
+      - name: 构建插件
+        run: npm run build
+
+      - name: 打包为发布 zip（平铺，不嵌套目录）
+        run: |
+          cp manifest.json dist/manifest.json
+          cd dist
+          zip -j ../tingfm-radio.zip index.js manifest.json
+
+      - name: 生成更新日志（取自提交标题）
+        id: release_notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            git log "$PREV_TAG".."${GITHUB_SHA}" --pretty=format:"- %s" > release_notes.md
+          else
+            git log --pretty=format:"- %s" > release_notes.md
+          fi
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tingfm-radio.zip
+          body_path: release_notes.md

@@ -1,0 +1,22 @@
+{
+  "id": "tingfm-radio",
+  "name": "听FM网络电台",
+  "version": "1.0.0",
+  "description": "接入听FM海量网络电台直播源，支持搜索添加全国各地电台",
+  "author": "xiaotian2333",
+  "path": "",
+  "repo": "https://github.com/EchoMusic-org/tingfm-radio",
+  "homepage": "https://github.com/EchoMusic-org/tingfm-radio",
+  "downloadUrl": "https://gh-mirror.928233.xyz/github/EchoMusic-org/tingfm-radio/releases/download/latest/tingfm-radio.zip",
+  "tags": [
+    "radio",
+    "fm"
+  ],
+  "main": "index.js",
+  "capabilities": {
+    "localFiles": true
+  },
+  "requires": {
+    "echoMusicVersion": ">=2.2.8"
+  }
+}
