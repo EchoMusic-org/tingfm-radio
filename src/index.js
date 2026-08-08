@@ -1,9 +1,9 @@
 // ============================================================
 // 听FM网络电台 —— 浏览器直连播放版
-// 电台数据以云端 data.json 为权威源，首次或更新时回写本地缓存，
-// 机制参考 github-accelerate 插件（本地兜底 + 每日版本检查）。
-// 结构为 fmdata[大区][地域][电台名] = { id, fmurl, img }，除加载
-// 图片 img、获取音频流 fmurl 与同步数据外，不再发起其它网络请求。
+// 电台列表以云端 data.json 为权威，首次或更新时回写本地缓存，
+// 机制参考抓取插件（本地兜底 + 每日版本检查）。
+// data.json 仅提供 { id, img }，音频流地址 fmurl 在播放时实时
+// 按 id 向 tingfm.net 接口获取（参考 tingfm-data/fetch.js）。
 // 真实声音由浏览器 <audio>/Hls 直接输出；插件劫持宿主底栏的
 // 播放/暂停按钮（.player-toggle），电台曲目命中时由插件自主
 // 控制浏览器音频，不再向播放引擎投喂任何音频数据。
@@ -12,7 +12,8 @@ export default async function (ctx) {
   const { defineComponent, h, ref, watch, computed } = ctx.vue
 
   // ---------------- 本地数据层（data.json） ----------------
-  // 结构：{ version, update, fmdata: { 大区: { 地域: { 电台名: { id, fmurl, img } } } } }
+  // 结构：{ version, update, fmdata: { 大区: { 地域: { 电台名: { id, img } } } } }
+  // 注意：data.json 不再提供 fmurl，流地址统一在播放时实时按 id 获取（见 fetchFmUrl）
   let fmData = null
   let regionGroups = []
   let stationById = new Map()
@@ -24,6 +25,37 @@ export default async function (ctx) {
   // 云端数据源（本地 data.json 仅为回写缓存），机制参考 github-accelerate
   const DATA_URL = 'https://oss.xt-url.com/EchoMusic/tingfm-radio/data.json'
   const DATA_PATH = () => `${ctx.descriptor.directory}/data.json`
+
+  // 实时流地址接口（参考 tingfm-data/fetch.js 的获取方式）
+  const STREAM_API = 'https://tingfm.net/wp-json/query/wndt_streams'
+  // 会话级流地址缓存：postId -> { url, exp }，exp 到期后重新拉取
+  const streamCache = new Map()
+
+  // 按电台 id 实时获取 fmurl：优先 m3u8，否则取第一个有 url 的流
+  async function fetchFmUrl(postId) {
+    const cached = streamCache.get(postId)
+    if (cached && (typeof cached.exp !== 'number' || cached.exp > Math.floor(Date.now() / 1000))) {
+      return cached.url
+    }
+    const res = await ctx.net.fetch(`${STREAM_API}?post_id=${postId}&in_web=true`, {
+      headers: {
+        'Referer': 'https://tingfm.net/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+      },
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const payload = await res.json()
+    let fmurl = ''
+    let exp = undefined
+    if (payload && payload.status === 1 && payload.data && Array.isArray(payload.data.streams)) {
+      const list = payload.data.streams
+      const m3u8 = list.find((s) => s.type === 'm3u8' && s.url)
+      fmurl = m3u8 ? m3u8.url : (list.find((s) => s.url) || {}).url || ''
+      if (typeof payload.data.exp === 'number') exp = payload.data.exp
+    }
+    streamCache.set(postId, { url: fmurl, exp })
+    return fmurl
+  }
 
   // 简易 semver 比较，x.y.z 格式
   const compareVersion = (a, b) => {
@@ -125,9 +157,7 @@ export default async function (ctx) {
             id,
             title,
             coverUrl: String(raw.img || ''),
-            fmUrl: String(raw.fmurl || ''),
           }
-          if (!station.fmUrl) continue
           stations.push(station)
           if (!stationById.has(id)) stationById.set(id, station)
           flatStations.push(station)
@@ -268,13 +298,13 @@ export default async function (ctx) {
     await ctx.storage.set('stations', savedStations.value)
   }
 
-  // 已保留的电台若在 data.json 中有最新数据，则回填标题/封面/流地址
+  // 已保留的电台若在 data.json 中有最新数据，则回填标题/封面
   // 收藏项仅保存 id + addedAt，其余元数据由 data.json 实时解析
   function savedItem(id) {
     return { id: String(id), addedAt: Date.now() }
   }
 
-  // 渲染/播放时把收藏项(id)解析为完整电台数据（含 fmUrl/title/coverUrl）
+  // 渲染/播放时把收藏项(id)解析为完整电台数据（含 title/coverUrl，fmurl 由 fetchFmUrl 实时获取）
   function fillSavedStation(station) {
     const current = getStationById(station.id)
     if (!current) {
@@ -331,15 +361,22 @@ export default async function (ctx) {
     }
   }
 
-  // 播放（插件自治）：直接用本地 data.json 的 fmurl 驱动浏览器音频播放
+  // 播放（插件自治）：播放时实时按 id 获取 fmurl 驱动浏览器音频播放
   // playSong 仅用于把电台放进引擎队列、让宿主底栏显示标题/封面，
   // 引擎本身不参与真实播放（不投喂音频数据）。
   async function playStation(station) {
     const postId = String(station.id || '')
     if (!postId) return
-    // 统一按 id 解析 data.json 最新数据，收藏/搜索/分区均可获得 fmUrl 与元数据
+    // 统一按 id 解析 data.json 最新元数据（收藏/搜索/分区均可获得标题与封面）
     const resolved = getStationById(postId) || station
-    const streamUrl = resolved.fmUrl
+    let streamUrl
+    try {
+      streamUrl = await fetchFmUrl(postId)
+    } catch (err) {
+      console.warn('[TingFM] 获取直播源失败:', err)
+      ctx.toast.danger('获取直播源失败，请重试')
+      return
+    }
     if (!streamUrl) {
       ctx.toast.warning('该电台暂无可用直播源')
       return
