@@ -454,7 +454,7 @@ export default async function (ctx) {
       await saveStations()
       ctx.toast.success(`已收藏「${meta.title}」`)
     }
-    applyHeartState()
+    syncRadioFavorite()
   }
 
   // 我的电台列表（收藏）
@@ -531,39 +531,40 @@ export default async function (ctx) {
 
   // ================= 劫持底栏收藏(红心)按钮 =================
   // 命中本插件正在播放的电台曲目时，截获底栏 .player-bar button[title="收藏"]
-  // 的 click，改为操作插件「我的电台」列表；同时直接操作红心 SVG 点亮/熄灭。
-  // 宿主 isFavorite 由宿主收藏列表计算，& 我们的电台不在其内恒为 false，不会
-  // 主动重渲染红心，故可安全直接修改其 DOM 外观。
-  let currentFavoriteBtn = null
+  // 的 click，改为操作插件「我的电台」列表。
+  // 红心点亮/熄灭不再直接改 DOM，而是把电台歌曲以 { source:'tingfm' } 身份
+  // 写进/移出宿主 playlist.favorites，宿主 isFavorite 响应式系统据此自动渲染。
+  const playlistStore = ctx.stores && ctx.stores.playlist
 
   const isHeartFaved = () => {
     return isOurTrackActive() && isStationSaved(currentPlayingId.value)
   }
 
-  // 点亮/熄灭红心：仅作用于 SVG 外观，不动宿主收藏数据
-  function applyHeartState() {
-    const btn = currentFavoriteBtn || document.querySelector('.player-bar button[title="收藏"]')
-    if (!btn) return
-    const svg = btn.querySelector('svg')
-    const path = svg && svg.querySelector('path[stroke], path')
-    if (!path) return
-    if (isHeartFaved()) {
-      path.setAttribute('fill', 'currentColor')
-      path.setAttribute('stroke', 'none')
-    } else {
-      path.removeAttribute('fill')
-      path.setAttribute('stroke', 'currentColor')
+  // 同步宿主收藏数据：把正在播放且已收藏的电台写入宿主 favorites，
+  // 否则从 favorites 中清除本插件的临时收藏条目（按 source 标记识别）。
+  function syncRadioFavorite() {
+    if (!playlistStore || !Array.isArray(playlistStore.favorites)) return
+    try {
+      const current = playlistStore.favorites
+      const next = current.filter((s) => !s || s.source !== 'tingfm')
+      if (isHeartFaved()) {
+        const station = getStationById(currentPlayingId.value) || fillSavedStation({
+          id: currentPlayingId.value,
+        })
+        if (station && station.title) {
+          next.unshift(createStationSong(station))
+        }
+      }
+      if (next.length !== current.length || next[0] !== current[0]) {
+        playlistStore.favorites = next
+      }
+    } catch (err) {
+      console.warn('[TingFM] 同步宿主收藏数据失败:', err)
     }
   }
 
   let favoriteClickListener = null
   const hijackFavorite = (btn) => {
-    currentFavoriteBtn = btn
-    // 记录宿主原始内联 SVG，便于 dispose/切换时无副作用地还原（仅用于兜底清理）
-    if (!btn.__tfOrigSvg && btn.querySelector('svg')) {
-      btn.__tfOrigSvg = btn.querySelector('svg').outerHTML
-    }
-    applyHeartState()
     if (!favoriteClickListener) {
       favoriteClickListener = (e) => {
         if (!isOurTrackActive()) return
@@ -576,29 +577,16 @@ export default async function (ctx) {
   }
   const removeFavoriteHijack = ctx.dom.observe('.player-bar button[title="收藏"]', hijackFavorite)
 
-  // 电台/收藏列表变化时同步红心状态（兜底宿主偶发重渲染导致的还原）
+  // 播放电台/收藏列表变化时同步宿主红心数据
   const favoriteStateWatch = watch(
     () => {
       const id = currentPlayingId.value
       const faved = id && isStationSaved(id) ? id + ':1' : (id || '') + ':0'
       return faved
     },
-    () => applyHeartState(),
-    { immediate: false },
+    () => syncRadioFavorite(),
+    { immediate: true },
   )
-
-  function restoreFavoriteButton() {
-    if (currentFavoriteBtn) {
-      if (currentFavoriteBtn.__tfOrigSvg && currentFavoriteBtn.querySelector('svg')) {
-        const svg = currentFavoriteBtn.querySelector('svg')
-        if (svg.outerHTML !== currentFavoriteBtn.__tfOrigSvg) {
-          svg.outerHTML = currentFavoriteBtn.__tfOrigSvg
-        }
-      }
-      currentFavoriteBtn.__tfOrigSvg = null
-    }
-    currentFavoriteBtn = null
-  }
 
   // ---------------- 样式 ----------------
   const removeStyle = ctx.css.inject(`
@@ -1066,13 +1054,18 @@ export default async function (ctx) {
   )
 
   ctx.dispose(() => {
+    // 卸载时从宿主收藏中清除本插件的临时收藏条目
+    try {
+      if (playlistStore && Array.isArray(playlistStore.favorites)) {
+        playlistStore.favorites = playlistStore.favorites.filter((s) => !s || s.source !== 'tingfm')
+      }
+    } catch (e) { /* 忽略 */ }
     removeStyle()
     removeQuickPlayCommand()
     removeNetworkFmPage()
     removeToggleHijack()
     removeFavoriteHijack()
     favoriteStateWatch()
-    restoreFavoriteButton()
     stopVolumeWatch()
     stopTrackWatch()
     errorBadgeWatch()
