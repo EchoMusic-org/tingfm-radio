@@ -261,7 +261,8 @@ export default async function (ctx) {
 
   function setBrowserVolume(v) {
     const n = Number(v)
-    audio.volume = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1
+    // 主程序音量 ctx.player.volume 量程为 0-100，需换算为 audio.volume 的 0-1
+    audio.volume = Number.isFinite(n) ? Math.min(1, Math.max(0, n / 100)) : 1
   }
 
   // ---------------- 数据访问（本地内存索引，无网络请求） ----------------
