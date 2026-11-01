@@ -1,7 +1,7 @@
 {
   "id": "tingfm-radio",
   "name": "听FM网络电台",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "接入听FM海量网络电台直播源，支持搜索添加全国各地电台",
   "author": "xiaotian2333",
   "path": "",
@@ -14,7 +14,8 @@
   ],
   "main": "index.js",
   "capabilities": {
-    "localFiles": true
+    "localFiles": true,
+    "audioSource": true
   },
   "requires": {
     "echoMusicVersion": ">=2.3.1"

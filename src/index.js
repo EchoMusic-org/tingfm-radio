@@ -4,9 +4,10 @@
 // 机制参考抓取插件（本地兜底 + 每日版本检查）。
 // data.json 仅提供 { id, img }，音频流地址 fmurl 在播放时实时
 // 按 id 向 tingfm.net 接口获取（参考 tingfm-data/fetch.js）。
-// 真实声音由浏览器 <audio>/Hls 直接输出；插件劫持宿主底栏的
-// 播放/暂停按钮（.player-toggle），电台曲目命中时由插件自主
-// 控制浏览器音频，不再向播放引擎投喂任何音频数据。
+// 真实声音由浏览器 <audio>/Hls 直接输出；电台曲目会通过音源
+// 解析接口注册一个本地静音 WAV 占位源：引擎正常进入播放态，
+// 不再因解析不到音源而弹「播放失败」并自动切歌；播放/暂停/
+// 音量/进度联动均由宿主原生驱动，插件只需同步浏览器音频。
 // ============================================================
 export default async function (ctx) {
   const { defineComponent, h, ref, watch, computed } = ctx.vue
@@ -265,6 +266,69 @@ export default async function (ctx) {
     audio.volume = Number.isFinite(n) ? Math.min(1, Math.max(0, n / 100)) : 1
   }
 
+  // ---------------- 引擎占位音源（本地静音 WAV） ----------------
+  // 电台曲目仅用于底栏展示，真实声音由上面的浏览器音频输出。若让引擎
+  // 自己解析 url 为空的电台曲目，会触发「播放失败 · 暂时无法获取可用
+  // 音源」，并在队列里还有其他歌曲时 3 秒后自动切歌，把真声音一起带走。
+  // 因此向引擎注册一个本地静音 WAV 占位音源：引擎正常进入播放态，失败
+  // 链路不再触发；占位源接近播完时回拉进度，避免自然结束触发切歌。
+  const SILENCE_WAV_SECONDS = 60
+  let silenceSourceUrl = null
+  let silenceSourcePromise = null
+
+  // 生成 8kHz 16bit 单声道、60 秒全零采样的 WAV（数据段无需填充，默认即为静音）
+  function buildSilenceWav() {
+    const sampleRate = 8000
+    const channels = 1
+    const bitsPerSample = 16
+    const bytesPerSample = bitsPerSample / 8
+    const dataBytes = sampleRate * channels * bytesPerSample * SILENCE_WAV_SECONDS
+    const buffer = new ArrayBuffer(44 + dataBytes)
+    const view = new DataView(buffer)
+    const writeText = (offset, text) => {
+      for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i))
+    }
+    writeText(0, 'RIFF')
+    view.setUint32(4, 36 + dataBytes, true)
+    writeText(8, 'WAVE')
+    writeText(12, 'fmt ')
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true) // PCM
+    view.setUint16(22, channels, true)
+    view.setUint32(24, sampleRate, true)
+    view.setUint32(28, sampleRate * channels * bytesPerSample, true)
+    view.setUint16(32, channels * bytesPerSample, true)
+    view.setUint16(34, bitsPerSample, true)
+    writeText(36, 'data')
+    view.setUint32(40, dataBytes, true)
+    return buffer
+  }
+
+  // 生成（或复用）插件目录下的静音 WAV，并转成引擎可加载的 file:// 地址
+  async function ensureSilenceSource() {
+    if (silenceSourceUrl) return silenceSourceUrl
+    if (!silenceSourcePromise) {
+      silenceSourcePromise = (async () => {
+        const path = `${ctx.descriptor.directory}/silence.wav`
+        const writeResult = await ctx.fs.writeFile(path, buildSilenceWav(), { overwrite: true })
+        if (writeResult && writeResult.ok === false) {
+          throw new Error(writeResult.error || '静音占位音源写入失败')
+        }
+        const urlResult = await ctx.fs.getFileUrl(path)
+        if (!urlResult || urlResult.ok === false || !urlResult.url) {
+          throw new Error((urlResult && urlResult.error) || '静音占位音源地址获取失败')
+        }
+        silenceSourceUrl = urlResult.url
+        return silenceSourceUrl
+      })()
+      silenceSourcePromise.catch(() => {
+        // 失败后允许下次重试
+        silenceSourcePromise = null
+      })
+    }
+    return silenceSourcePromise
+  }
+
   // ---------------- 数据访问（本地内存索引，无网络请求） ----------------
   function getStationById(postId) {
     return stationById.get(String(postId)) || null
@@ -461,31 +525,49 @@ export default async function (ctx) {
   // 我的电台列表（收藏）
   let savedStations = ref([])
 
-  // ================= 劫持主界面播放/暂停按钮 =================
-  // 命中本插件正在播放的电台曲目时，截获底栏 .player-toggle 的
-  // click 事件，阻止引擎的 togglePlay 生效，改由插件直接驱动浏览器
-  // 音频的播放/暂停；非电台曲目放行，不影响引擎正常行为。
+  // ================= 引擎播放状态联动（替代旧的播放按钮劫持） =================
+  // 电台曲目在引擎侧播的是静音占位音源，真实声音由插件浏览器音频输出。
+  // 底栏播放/暂停按钮、系统媒体键、蓝牙耳机的暂停恢复都由引擎原生处理，
+  // 插件只需监听引擎 isPlaying 同步浏览器音频：
+  // - 引擎暂停 -> 浏览器音频同步暂停；引擎恢复 -> 同步恢复
+  // - 插件页「停止」会清空音频源，引擎再次进入播放态时重新拉流播放
   const isOurTrackActive = () => {
     const id = ctx.player.currentTrackId ? ctx.player.currentTrackId.value : null
     return !!id && String(id).startsWith('tingfm:') && !!currentPlayingId.value
   }
 
-  let toggleClickListener = null
-  const hijackToggle = (btn) => {
-    if (toggleClickListener || !btn) return
-    toggleClickListener = (e) => {
-      if (!isOurTrackActive()) return
-      e.preventDefault()
-      e.stopImmediatePropagation()
-      if (audio.paused && !audio.ended) {
-        void resumeStationAudio()
-      } else {
+  const playingWatch = watch(
+    () => (ctx.player.isPlaying ? ctx.player.isPlaying.value : false),
+    (playing) => {
+      const id = ctx.player.currentTrackId ? ctx.player.currentTrackId.value : null
+      if (!id || !String(id).startsWith('tingfm:')) return
+      if (!playing) {
         pauseStationAudio()
+        return
       }
-    }
-    btn.addEventListener('click', toggleClickListener, true)
-  }
-  const removeToggleHijack = ctx.dom.observe('.player-toggle', hijackToggle)
+      if (currentPlayingId.value && (audio.src || hls)) {
+        void safePlay(2)
+        return
+      }
+      // 音频源缺失（如插件页停止后再按底栏播放）：按引擎曲目 id 重新拉流
+      const postId = currentPlayingId.value || String(id).slice('tingfm:'.length)
+      const station = getStationById(postId)
+      if (station) void playStation(station)
+    },
+  )
+
+  // 占位音源时长有限（60 秒），接近结尾时把引擎进度拉回起点，
+  // 避免占位源自然播完触发引擎切歌，把正在收听的电台一起切走
+  const progressWatch = watch(
+    () => (ctx.player.currentTime ? ctx.player.currentTime.value : 0),
+    (time) => {
+      if (!currentPlayingId.value) return
+      const playing = ctx.player.isPlaying ? ctx.player.isPlaying.value : false
+      if (playing && isOurTrackActive() && time > SILENCE_WAV_SECONDS - 10) {
+        ctx.player.seek(0)
+      }
+    },
+  )
 
   // 宿主音量变化 -> 浏览器音频
   const stopVolumeWatch = watch(
@@ -1035,6 +1117,27 @@ export default async function (ctx) {
   await loadFmData()
   await loadSavedStations()
 
+  // 注册引擎音源解析：电台曲目统一解析为静音占位音源，让引擎正常进入
+  // 播放态，不再弹「播放失败」并在 3 秒后自动切下一首。解析失败（如磁盘
+  // 异常）时返回 null，交回引擎默认兜底链（此时报错是真实故障）。
+  let removeAudioSourceResolver = null
+  try {
+    removeAudioSourceResolver = ctx.player.audioSource.register({
+      id: 'tingfm-station-silence',
+      match: (context) => {
+        const track = context && context.track
+        if (!track) return false
+        return track.source === 'tingfm' || String(track.id || '').startsWith('tingfm:')
+      },
+      resolve: async () => {
+        const url = await ensureSilenceSource()
+        return url ? { url } : null
+      },
+    })
+  } catch (err) {
+    console.warn('[TingFM] 注册占位音源失败（宿主可能不支持音源解析能力）:', err)
+  }
+
   // 在「发现音乐」侧边栏分组下新增「网络FM」板块（插件页）
   const removeNetworkFmPage = ctx.ui.addPage({
     id: 'network-fm',
@@ -1064,9 +1167,11 @@ export default async function (ctx) {
     removeStyle()
     removeQuickPlayCommand()
     removeNetworkFmPage()
-    removeToggleHijack()
+    if (typeof removeAudioSourceResolver === 'function') removeAudioSourceResolver()
     removeFavoriteHijack()
     favoriteStateWatch()
+    playingWatch()
+    progressWatch()
     stopVolumeWatch()
     stopTrackWatch()
     errorBadgeWatch()
