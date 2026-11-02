@@ -605,12 +605,15 @@ export default async function (ctx) {
     () => syncErrorBadgeClass(),
     { immediate: true },
   )
-  // 兜底：徽标出现且命中电台曲目时，直接隐藏该元素，避免时序漏网
+  // 兜底：徽标出现且命中电台曲目时，直接隐藏该元素，避免时序漏网。
+  // 目标都在底栏内，观察根收敛到 .player-bar，避免 body 级全文档扫描；
+  // 底栏尚未挂载时退回 body 观察（宿主初始 scan 会兜底命中）
+  const playerBarRoot = typeof document !== 'undefined' ? document.querySelector('.player-bar') : null
   const errBadgeObserve = ctx.dom.observe('.player-error-indicator', (el) => {
     if (isOurTrackActive() && el && typeof el.style !== 'undefined') {
       el.style.display = 'none'
     }
-  })
+  }, playerBarRoot ? { root: playerBarRoot } : undefined)
 
   // ================= 劫持底栏收藏(红心)按钮 =================
   // 命中本插件正在播放的电台曲目时，截获底栏 .player-bar button[title="收藏"]
@@ -658,7 +661,12 @@ export default async function (ctx) {
     }
     btn.addEventListener('click', favoriteClickListener, true)
   }
-  const removeFavoriteHijack = ctx.dom.observe('.player-bar button[title="收藏"]', hijackFavorite)
+  // 收藏按钮同样收敛到底栏根，理由同上
+  const removeFavoriteHijack = ctx.dom.observe(
+    '.player-bar button[title="收藏"]',
+    hijackFavorite,
+    playerBarRoot ? { root: playerBarRoot } : undefined,
+  )
 
   // 播放电台/收藏列表变化时同步宿主红心数据
   const favoriteStateWatch = watch(
@@ -1028,6 +1036,8 @@ export default async function (ctx) {
       const activeRegionName = ref(defaultRegion ? defaultRegion.name : '')
       const stations = ref(defaultRegion ? defaultRegion.stations : [])
       const searchKeyword = ref('')
+      // 搜索输入防抖定时器：一次性短定时器，组件卸载时残留的回调仅写一个 ref，无副作用
+      let searchDebounceTimer = null
 
       const activeGroup = computed(() => {
         return regionGroups.find((g) => g.name === activeGroupName.value) ?? regionGroups[0]
@@ -1090,7 +1100,15 @@ export default async function (ctx) {
             h('input', {
               placeholder: `筛选 ${activeRegionName.value} 电台...`,
               value: searchKeyword.value,
-              onInput: (e) => { searchKeyword.value = e.target.value },
+              // 输入防抖：每敲一个字符会触发过滤 + 全部卡片重渲，长关键词连续输入时开销放大
+              onInput: (e) => {
+                const value = e.target.value
+                if (searchDebounceTimer) clearTimeout(searchDebounceTimer)
+                searchDebounceTimer = setTimeout(() => {
+                  searchDebounceTimer = null
+                  searchKeyword.value = value
+                }, 180)
+              },
             }),
           ]),
         ]),
