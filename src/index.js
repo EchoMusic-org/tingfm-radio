@@ -272,11 +272,18 @@ export default async function (ctx) {
   // 音源」，并在队列里还有其他歌曲时 3 秒后自动切歌，把真声音一起带走。
   // 因此向引擎注册一个本地静音 WAV 占位音源：引擎正常进入播放态，失败
   // 链路不再触发；占位源接近播完时回拉进度，避免自然结束触发切歌。
-  const SILENCE_WAV_SECONDS = 60
+  //
+  // 时长与回拉阈值的选择依据宿主引擎的无缝/智能混音预取窗口：
+  // 引擎在「距结尾 30 秒（无缝 gapless）～75 秒（智能混音 automix）」就会
+  // 预取下一首并提前无缝切换，所以占位源必须远长于该窗口、并且进度必须在
+  // 进入预取窗口之前回拉到位，否则仍会被切走。这里取 180 秒 + 30 秒回拉，
+  // 保证 currentTime 始终远离 180-75=105 秒的预取边界。
+  const SILENCE_WAV_SECONDS = 180
+  const SILENCE_SEEK_BACK_AT_SECS = 30
   let silenceSourceUrl = null
   let silenceSourcePromise = null
 
-  // 生成 8kHz 16bit 单声道、60 秒全零采样的 WAV（数据段无需填充，默认即为静音）
+  // 生成 8kHz 16bit 单声道、全零采样的 WAV（数据段无需填充，默认即为静音）
   function buildSilenceWav() {
     const sampleRate = 8000
     const channels = 1
@@ -556,14 +563,14 @@ export default async function (ctx) {
     },
   )
 
-  // 占位音源时长有限（60 秒），接近结尾时把引擎进度拉回起点，
-  // 避免占位源自然播完触发引擎切歌，把正在收听的电台一起切走
+  // 占位音源时长很长（180 秒），在引擎进入无缝/智能混音预取窗口前
+  // 就把进度拉回开头，避免占位源接近结尾被引擎预取下一首而无缝切走
   const progressWatch = watch(
     () => (ctx.player.currentTime ? ctx.player.currentTime.value : 0),
     (time) => {
       if (!currentPlayingId.value) return
       const playing = ctx.player.isPlaying ? ctx.player.isPlaying.value : false
-      if (playing && isOurTrackActive() && time > SILENCE_WAV_SECONDS - 10) {
+      if (playing && isOurTrackActive() && time > SILENCE_SEEK_BACK_AT_SECS) {
         ctx.player.seek(0)
       }
     },
